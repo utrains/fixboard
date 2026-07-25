@@ -1,0 +1,36 @@
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Reverse proxy API calls to the backend at runtime, so the frontend
+    # bundle never has an absolute backend host baked into it (see
+    # VITE_API_URL=/api in the Dockerfile). ${BACKEND_UPSTREAM} is
+    # substituted from the container's env at startup (nginx's built-in
+    # envsubst-on-templates entrypoint script) — Docker Compose points it
+    # at the "backend" service name, Kubernetes at the backend Service's
+    # cluster DNS name. The trailing slash on proxy_pass strips /api/
+    # before forwarding.
+    location /api/ {
+        proxy_pass ${BACKEND_UPSTREAM}/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # SPA fallback: let React Router handle client-side routes
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

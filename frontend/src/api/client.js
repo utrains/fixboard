@@ -1,4 +1,7 @@
-export const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+// Relative by default so the built bundle works unmodified behind any
+// origin's reverse proxy (Docker Compose, Kubernetes, ...) — Nginx forwards
+// /api/* to the backend at runtime, so no absolute host is baked in here.
+export const API_URL = import.meta.env.VITE_API_URL || '/api';
 const TOKEN_KEY = 'fixboard_token';
 
 export function getToken() {

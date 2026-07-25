@@ -37,10 +37,11 @@ services:
   frontend:
     build:
       context: ./frontend
-      args:
-        # Baked in at build time (Vite), so it must be the URL the
-        # *browser* can reach — not the in-network "backend" hostname.
-        VITE_API_URL: http://localhost:${BACKEND_PORT:-3000}
+      # No VITE_API_URL build-arg: the image's default (/api) is relative,
+      # so it works unmodified regardless of what host/port serves it.
+      # Nginx reverse-proxies /api/* to BACKEND_UPSTREAM at runtime instead.
+    environment:
+      BACKEND_UPSTREAM: http://backend:3000
     ports:
       - "${FRONTEND_PORT:-8090}:80"
     depends_on:
