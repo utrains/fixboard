@@ -17,7 +17,7 @@ that come after this.
 
 ## Quick start
 
-Requirements: Docker + Docker Compose.
+Requirements: Docker and Docker Compose.
 
 ```bash
 docker compose up --build
