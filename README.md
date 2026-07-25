@@ -1,8 +1,8 @@
 # FixBoard
 
 A troubleshooting Q&A board for DevOps/Cloud/SRE/Platform Engineering
-students. Posts capture full problem context — environment, logs,
-architecture — so answers become a searchable, reusable knowledge base
+students. Posts capture full problem context environment, logs,
+architecture so answers become a searchable, reusable knowledge base
 instead of one-off chat messages.
 
 This is a teaching project. The stack is kept deliberately simple so the
