@@ -23,7 +23,7 @@ Requirements: Docker and Docker Compose.
 docker compose up --build
 ```
 
-That's it — no manual setup required. This brings up three services:
+That's it no manual setup required. This brings up three services:
 
 | Service    | URL                     | What it is                          |
 |------------|--------------------------|--------------------------------------|
