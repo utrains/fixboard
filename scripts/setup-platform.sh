@@ -12,7 +12,8 @@
 set -euo pipefail
 shopt -s inherit_errexit
 
-trap 'echo; echo "==> FAILED at line ${LINENO}. Aborting — nothing past this point ran." >&2' ERR
+ERR_TRAP='echo; echo "==> FAILED at line ${LINENO}. Aborting — nothing past this point ran." >&2'
+trap "$ERR_TRAP" ERR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -23,6 +24,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # ---------------------------------------------------------------------------
 CLUSTER_NAME="${CLUSTER_NAME:-ridgeline-fixboard}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
+EKS_VERSION="${EKS_VERSION:-1.31}"
 NODEGROUP_NAME="${NODEGROUP_NAME:-fixboard-workers}"
 NODE_TYPE="${NODE_TYPE:-t3.medium}"
 NODES="${NODES:-2}"
@@ -106,6 +108,7 @@ else
   eksctl create cluster \
     --name "$CLUSTER_NAME" \
     --region "$AWS_REGION" \
+    --version "$EKS_VERSION" \
     --nodegroup-name "$NODEGROUP_NAME" \
     --node-type "$NODE_TYPE" \
     --nodes "$NODES" \
@@ -114,7 +117,17 @@ else
     --managed
 fi
 
-log_step "1.2 Verify"
+log_step "1.2 Wait for the cluster and nodegroup to be ready"
+# Runs unconditionally, even on the skip branch above — same "resume
+# correctly after an interrupted run" shape as the RDS wait in Phase 6.4.
+# describe-cluster succeeds for CREATING/UPDATING/FAILED states too, not
+# just ACTIVE, so "already exists" alone doesn't mean "ready" — without
+# this, a re-run after the ~20-minute create got interrupted would skip
+# straight to kubectl calls against a cluster/nodegroup that isn't up yet.
+aws eks wait cluster-active --name "$CLUSTER_NAME" --region "$AWS_REGION"
+aws eks wait nodegroup-active --cluster-name "$CLUSTER_NAME" --nodegroup-name "$NODEGROUP_NAME" --region "$AWS_REGION"
+
+log_step "1.3 Verify"
 aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" >/dev/null
 kubectl get nodes
 
@@ -241,6 +254,10 @@ if [[ -z "$VPC_ID" || "$VPC_ID" == "None" ]]; then
   echo "ERROR: could not determine the cluster's VPC ID." >&2
   exit 1
 fi
+if [[ -z "$SUBNET_IDS" ]]; then
+  echo "ERROR: could not determine the cluster's subnet IDs." >&2
+  exit 1
+fi
 if [[ -z "$EKS_NODE_SG" ]]; then
   echo "ERROR: could not determine the node security group for nodegroup '${NODEGROUP_NAME}'." >&2
   exit 1
@@ -264,6 +281,11 @@ else
 fi
 
 log_step "5.3 Allow NFS traffic from nodes"
+# set +e alone does not stop the ERR trap from firing on a non-zero command —
+# only from making the shell exit — so the trap is disabled here too, or the
+# expected/handled "already exists" case below would still print a bogus
+# "FAILED" message.
+trap - ERR
 set +e
 INGRESS_OUTPUT="$(aws ec2 authorize-security-group-ingress \
   --group-id "$SG_ID" \
@@ -272,6 +294,7 @@ INGRESS_OUTPUT="$(aws ec2 authorize-security-group-ingress \
   --region "$AWS_REGION" 2>&1)"
 INGRESS_STATUS=$?
 set -e
+trap "$ERR_TRAP" ERR
 if [[ $INGRESS_STATUS -ne 0 ]]; then
   if echo "$INGRESS_OUTPUT" | grep -q "InvalidPermission.Duplicate"; then
     log_info "NFS ingress rule already present — skipping."
@@ -282,13 +305,39 @@ if [[ $INGRESS_STATUS -ne 0 ]]; then
 fi
 
 log_step "5.4 Create the filesystem and mount targets"
-# create-file-system is natively idempotent on --creation-token: re-running
-# with the same token returns the existing filesystem instead of erroring.
-EFS_ID="$(aws efs create-file-system \
-  --creation-token "$EFS_CREATION_TOKEN" \
-  --tags "Key=Name,Value=${EFS_NAME_TAG}" \
-  --output text --query "FileSystemId" --region "$AWS_REGION")"
-log_info "EFS filesystem: ${EFS_ID}"
+# --creation-token idempotency only covers AWS retrying the same in-flight
+# request; once a filesystem with this token has actually finished being
+# created, a repeat create-file-system call errors with FileSystemAlreadyExists
+# instead of returning the existing filesystem — so check first, like every
+# other resource in this script.
+EFS_ID="$(aws efs describe-file-systems --creation-token "$EFS_CREATION_TOKEN" --region "$AWS_REGION" \
+  --query "FileSystems[0].FileSystemId" --output text 2>/dev/null || true)"
+if [[ -n "$EFS_ID" && "$EFS_ID" != "None" ]]; then
+  log_info "EFS filesystem with creation token '${EFS_CREATION_TOKEN}' already exists (${EFS_ID}) — skipping."
+else
+  EFS_ID="$(aws efs create-file-system \
+    --creation-token "$EFS_CREATION_TOKEN" \
+    --tags "Key=Name,Value=${EFS_NAME_TAG}" \
+    --output text --query "FileSystemId" --region "$AWS_REGION")"
+  log_info "Created EFS filesystem: ${EFS_ID}"
+fi
+
+# A freshly created filesystem starts in "creating" state; create-mount-target
+# fails with IncorrectFileSystemLifeCycleState until it flips to "available".
+# The AWS CLI has no waiter for EFS, so poll manually. Runs unconditionally
+# (not just on first creation) since a re-run could still land here moments
+# after create-file-system returned on a previous invocation.
+EFS_STATE=""
+for _ in $(seq 1 60); do
+  EFS_STATE="$(aws efs describe-file-systems --file-system-id "$EFS_ID" --region "$AWS_REGION" \
+    --query "FileSystems[0].LifeCycleState" --output text)"
+  [[ "$EFS_STATE" == "available" ]] && break
+  sleep 5
+done
+if [[ "$EFS_STATE" != "available" ]]; then
+  echo "ERROR: EFS filesystem '${EFS_ID}' did not reach 'available' in time (last state: ${EFS_STATE})." >&2
+  exit 1
+fi
 
 EXISTING_MT_SUBNETS="$(aws efs describe-mount-targets --file-system-id "$EFS_ID" --region "$AWS_REGION" \
   --query "MountTargets[].SubnetId" --output text 2>/dev/null || true)"
@@ -298,6 +347,7 @@ for subnet in $SUBNET_IDS; do
     log_info "Mount target for ${subnet} already exists — skipping."
     continue
   fi
+  trap - ERR
   set +e
   MT_OUTPUT="$(aws efs create-mount-target \
     --file-system-id "$EFS_ID" \
@@ -306,6 +356,7 @@ for subnet in $SUBNET_IDS; do
     --region "$AWS_REGION" 2>&1)"
   MT_STATUS=$?
   set -e
+  trap "$ERR_TRAP" ERR
   if [[ $MT_STATUS -ne 0 ]]; then
     # A filesystem gets one mount target per AZ, not per subnet — if the
     # VPC has multiple subnets in the same AZ, this is expected, not a
@@ -387,6 +438,7 @@ else
   log_info "Created security group '${RDS_SG_NAME}' (${RDS_SG_ID})."
 fi
 
+trap - ERR
 set +e
 RDS_INGRESS_OUTPUT="$(aws ec2 authorize-security-group-ingress \
   --group-id "$RDS_SG_ID" \
@@ -395,6 +447,7 @@ RDS_INGRESS_OUTPUT="$(aws ec2 authorize-security-group-ingress \
   --region "$AWS_REGION" 2>&1)"
 RDS_INGRESS_STATUS=$?
 set -e
+trap "$ERR_TRAP" ERR
 if [[ $RDS_INGRESS_STATUS -ne 0 ]]; then
   if echo "$RDS_INGRESS_OUTPUT" | grep -q "InvalidPermission.Duplicate"; then
     log_info "PostgreSQL ingress rule already present — skipping."
